@@ -1,7 +1,6 @@
 const extractBtn = document.getElementById("extractBtn");
 const fileInput = document.getElementById("fileInput");
-const output = document.getElementById("output");60
-
+const output = document.getElementById("output");
 
 extractBtn.addEventListener("click", () => {
   const file = fileInput.files[0];
@@ -11,19 +10,25 @@ extractBtn.addEventListener("click", () => {
     return;
   }
 
-  // Dummy JSON for now (backend later)
-  const result = {
-    patient: {
-      name: "—",
-      age: "—",
-      ward_no: "—",
-      doctor: "—"
-    },
-    admitted_date: "—",
-    discharged_date: "—",
-    treatment_given: [],
-    drug_advice: []
-  };
+  const formData = new FormData();
+  formData.append("file", file);
 
-  output.textContent = JSON.stringify(result, null, 2);
+  output.textContent = "Uploading...";
+
+  fetch("http://127.0.0.1:8000/upload", {
+    method: "POST",
+    body: formData
+  })
+    .then(async (res) => {
+      const text = await res.text();
+      if (!res.ok) throw new Error(text);
+      return JSON.parse(text);
+    })
+    .then((data) => {
+      output.textContent = JSON.stringify(data, null, 2);
+    })
+    .catch((err) => {
+      output.textContent = "Upload failed:\n" + err.message;
+      console.error(err);
+    });
 });
