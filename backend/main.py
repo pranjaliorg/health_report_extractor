@@ -20,14 +20,11 @@ app.add_middleware(
 async def upload_file(file: UploadFile = File(...)):
     contents = await file.read()
 
-    # 1) Ensure it's a PDF (basic check)
     if file.content_type != "application/pdf" and not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file")
 
-    # 2) Read PDF from bytes (no saving needed)
     reader = PdfReader(io.BytesIO(contents))
 
-    # 3) Extract text from all pages
     text_parts = []
     for page in reader.pages:
         page_text = page.extract_text() or ""
@@ -38,6 +35,6 @@ async def upload_file(file: UploadFile = File(...)):
     return {
         "filename": file.filename,
         "pages": len(reader.pages),
-        "text_preview": full_text[:1000],   # first 1000 chars
+        "text_preview": full_text[:1000],   
         "total_chars": len(full_text),
     }
