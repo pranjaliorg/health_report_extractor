@@ -15,7 +15,7 @@ extractBtn.addEventListener("click", () => {
 
   output.textContent = "Uploading...";
 
-  fetch("http://127.0.0.1:8000/upload", {
+  fetch("http://127.0.0.1:5000/upload", {
     method: "POST",
     body: formData
   })
