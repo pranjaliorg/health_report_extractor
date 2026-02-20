@@ -187,6 +187,47 @@ def build_json(t: str) -> dict:
             "duration_days": duration_days,
             "quantity": quantity,
         }
+    
+    def infer_unit(name: str):
+        s = (name or "").upper()
+        if "OINT" in s or "OINTMENT" in s:
+            return "ointment"
+        if "GEL" in s:
+            return "gel"
+        if "CAP" in s or "CAPSULE" in s:
+            return "capsule"
+        if "TAB" in s or "TABLET" in s:
+            return "tablet"
+        return "dose"
+
+    def interpret_schedule(dose_schedule: str, unit="tablet"):
+        if not dose_schedule:
+            return None
+        parts = [p.strip() for p in dose_schedule.split("-")]
+        if len(parts) != 3:
+            return None
+        times = ["morning", "afternoon", "night"]
+        phrases= []
+        verb = "apply" if unit in ("ointment", "gel") else "take"
+
+        for i, tok in enumerate(parts):
+            if tok in ("0", "0.0", ""):
+                continue
+            qty = tok
+            if tok in ("0.5", "1/2"):
+                qty = "1/2"
+            else:
+                try:
+                    qty = str(int(float(tok))) if float(tok).is_integer() else tok
+                except:
+                    qty = tok
+
+            if verb == "apply":
+                phrases.append(f"Apply in {times[i]}")
+            else:
+                phrases.append(f"Take {qty} {unit} in {times[i]}")        
+
+        return ", ".join(phrases) if phrases else None
 
     def parse_drug_advice(block: str):
         out = []
@@ -236,6 +277,11 @@ def build_json(t: str) -> dict:
 
                 composition_lines.append(ln)
 
+            if composition_lines and composition_lines[0].strip().upper() == "MG":
+                if not re.search(r"\bMG\b", name_line, re.IGNORECASE):
+                    name_line = (name_line + " MG").strip()
+                composition_lines = composition_lines[1:]
+
             dose_schedule = timing = frequency = duration_days = quantity = None
             if schedule_line:
                 parsed = parse_schedule(schedule_line)
@@ -255,12 +301,16 @@ def build_json(t: str) -> dict:
             composition_lines = [c for c in composition_lines if not re.match(r"^\d+$", c.strip())]
             composition = clean_val(" ".join(composition_lines))
 
+            unit = infer_unit(name_line)
+            dose_schedule_text = interpret_schedule(dose_schedule, unit)
+
             out.append(
                 {
                     "sr_no": sr_no,
                     "name": clean_val(name_line),
                     "composition": composition,
                     "dose_schedule": dose_schedule,
+                    "dose_schedule_text": dose_schedule_text,
                     "timing": timing,
                     "frequency": frequency,
                     "duration_days": duration_days,
@@ -275,9 +325,75 @@ def build_json(t: str) -> dict:
         raw = section(r"Discharge notes\s*:", r"Complaints On Admission\s*:")
         raw = normalize_block_text(raw)
         if not raw:
-            return []
-        parts = re.split(r"\.\s+", raw)
-        return [p.strip() + ("." if p and not p.strip().endswith(".") else "") for p in parts if p.strip()]
+            return {"raw": None, "investigation_advice": {"tests": [], "test_date": None},
+                    "follow_up": {"date": None, "time": None, "doctor": None, "location": None},
+                    "red_flags": [], "emergency_contacts": []}
+
+        s = re.sub(r"\s+", " ", raw).strip()
+
+        date_re = r"(\d{1,2}/\d{1,2}/\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})"
+
+        m_adv = re.search(r"\bAdvice\s+(.*?)(?=\.\s*On\s+" + date_re + r"|\b(F/U|Follow\s*up)\b|Please\s+contact|$)", s, re.IGNORECASE)
+        adv = (m_adv.group(1).strip(" ,.") if m_adv else "")
+
+        m_test_date = re.search(r"\bon\s+" + date_re, adv, re.IGNORECASE)
+        test_date = m_test_date.group(1) if m_test_date else None
+        if test_date:
+            adv = re.sub(r"\bon\s+" + date_re, "", adv, flags=re.IGNORECASE).strip(" ,.")
+
+        adv = adv.replace(". ", ", ")
+        adv = re.sub(r"\s*-\s*", "-", adv)
+        tests = [x.strip(" ,.") for x in adv.split(",") if x.strip(" ,.")]
+
+        fu = re.search(r"(\bOn\s+" + date_re + r".*?\bfollow\s*up\b.*?|\b(F/U|Follow\s*up)\b.*?)(?=Please\s+contact|$)", s, re.IGNORECASE)
+        fu = fu.group(0) if fu else ""
+
+        fu_date = None
+
+        p1 = re.search(r"\bOn\s+(\d{1,2}/\d{1,2}/\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})\s+follow\s*up\b", fu, re.I)
+        p2 = re.search(r"\bfollow\s*up\b.*?\bon\s+(\d{1,2}/\d{1,2}/\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})\b", fu, re.I)
+        p3 = re.search(r"\bF/U\b.*?\bon\s+(\d{1,2}/\d{1,2}/\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})\b", fu, re.I)
+
+        if p1:
+            fu_date = p1.group(1)
+        elif p2:
+            fu_date = p2.group(1)
+        elif p3:
+            fu_date = p3.group(1)
+        else:
+            any_d = re.findall(r"(\d{1,2}/\d{1,2}/\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})", fu, flags=re.I)
+            fu_date = any_d[-1] if any_d else None
+
+        m_time = re.search(r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))|@\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)", fu)
+        fu_time = (m_time.group(1) or m_time.group(2)).strip() if m_time else None
+
+        m_doc = re.search(r"\bDr\.?\s*([A-Za-z\.\s]+?)(?:'s\s*OPD|\bOPD\b)", fu, re.IGNORECASE)
+        fu_doctor = ("Dr. " + m_doc.group(1).strip()).replace("Dr. Dr.", "Dr.") if m_doc else None
+
+        m_loc = re.search(r"\b(?:at|in)\s+([A-Za-z ]+Hospital)\b", fu, re.IGNORECASE)
+        fu_loc = m_loc.group(1).strip() if m_loc else None
+
+        contacts = []
+        for ph in re.findall(r"\b\d{8,13}\b", s):
+            if ph not in contacts:
+                contacts.append(ph)
+
+        m_rf = re.search(r"\bPlease\s+contact.*?\bif\b\s+(.+)$", s, re.IGNORECASE)
+        red_flags = []
+        if m_rf:
+            txt = m_rf.group(1).strip(" ,.")
+            txt = re.sub(r"\bat\s+.*$", "", txt, flags=re.IGNORECASE).strip(" ,.")
+            txt = txt.replace(" or ", ", ")
+            red_flags = [x.strip(" ,.") for x in txt.split(",") if x.strip(" ,.")]
+
+        return {
+            "raw": s,
+            "investigation_advice": {"tests": tests, "test_date": test_date},
+            "follow_up": {"date": fu_date, "time": fu_time, "doctor": fu_doctor, "location": fu_loc},
+            "red_flags": red_flags,
+            "emergency_contacts": contacts,
+        }
+
 
     def parse_complaints():
         lines = list_section(r"Complaints On Admission\s*:", r"Medical History\s*:")
@@ -359,10 +475,15 @@ def build_json(t: str) -> dict:
         return names
 
     patient_name = find(r"NAME\s*:\s*([^\n]+)")
-    doctor = find(r"Doctor\s*:\s*(.+?)\nIPD\s*NO", re.IGNORECASE | re.DOTALL)
+    doctor = find(
+        r"Doctor\s*:\s*(.+?)(?=\n(?:IPD\s*NO|UHID|WARD/BED\s*NO|AGE|Admitted\s*Date|Discharged\s*Date|DISCHARGE\s*TYPE|SECONDARY\s*CONSULTANT)\s*:)",
+        re.IGNORECASE | re.DOTALL
+    )
+    if doctor:
+        doctor = re.sub(r"\s+", " ", doctor).strip()
     ipd_no = find(r"IPD\s*NO\s*:\s*([A-Z0-9 ]+)")
     uhid = find(r"UHID\s*:\s*([A-Z0-9]+)")
-    ward_bed_no = find(r"WARD/\s*BED\s*NO\s*:\s*([A-Z0-9\.\-/]+)", re.IGNORECASE | re.DOTALL)
+    ward_bed_no = find(r"WARD/\s*BED\s*NO\s*:\s*([^\n]+)")
     admitted_date = find(r"Admitted\s*Date\s*:\s*([0-9/:\s]+)")
     discharge_type = find(r"DISCHARGE\s*TYPE\s*:\s*([^\n]+)")
     payer_type = find(r"Payer\s*Type\s*:\s*([^\n]+)")
@@ -370,7 +491,9 @@ def build_json(t: str) -> dict:
 
     age = None
     gender = None
-    m = re.search(r"AGE\s*:\s*(\d+)\s*YEARS\s*/\s*([MF])", t, re.IGNORECASE)
+
+    m = re.search(r"(?:AGE|GENDER|SEX)\s*:\s*(\d+)\s*YEARS?\s*/\s*([MF])", t, re.IGNORECASE)
+
     if m:
         age = int(m.group(1))
         gender = "Male" if m.group(2).upper() == "M" else "Female"
@@ -380,7 +503,7 @@ def build_json(t: str) -> dict:
         referred_to.append({"sr_no": int(m.group(1)), "doctor": clean_val(m.group(2)), "department": clean_val(m.group(3))})
 
     provisional_diagnosis = parse_provisional(section(r"Provisional Diagnosis\s*", r"\nDiagnosis\s*:"))
-    diagnosis = parse_diagnosis(section(r"Diagnosis\s*:", r"Drug Advice"))  # bug fixed: always parsed
+    diagnosis = parse_diagnosis(section(r"Diagnosis\s*:", r"Drug Advice"))
     drug_advice = parse_drug_advice(section(r"Drug Advice", r"Discharge notes\s*:"))
 
     discharge_notes = parse_discharge_notes()
