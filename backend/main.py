@@ -1,6 +1,10 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pypdf import PdfReader
+from datetime import datetime
+import json
+from db import SessionLocal
+from models import Report
 import io
 import re
 
@@ -52,6 +56,32 @@ def clean_text(text: str) -> str:
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out
 
+def to_iso_datetime(s):
+    if not s:
+        return None
+
+    s = re.sub(r"\s+", " ", s).strip()
+
+    m = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{4})(?:\s+(\d{1,2}:\d{2})\s*(AM|PM|am|pm)?)?", s)
+    if not m:
+        return None
+
+    date_part = m.group(1).replace("-", "/")
+    time_part = m.group(2)
+    ampm = m.group(3)
+
+    try:
+        if time_part and ampm:
+            dt = datetime.strptime(f"{date_part} {time_part} {ampm}", "%d/%m/%Y %I:%M %p")
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        elif time_part:
+            dt = datetime.strptime(f"{date_part} {time_part}", "%d/%m/%Y %H:%M")
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            dt = datetime.strptime(date_part, "%d/%m/%Y")
+            return dt.strftime("%Y-%m-%d")
+    except:
+        return None
 
 def build_json(t: str) -> dict:
     def clean_val(x):
@@ -394,9 +424,8 @@ def build_json(t: str) -> dict:
             "emergency_contacts": contacts,
         }
 
-
     def parse_complaints():
-        lines = list_section(r"Complaints On Admission\s*:", r"Medical History\s*:")
+        lines = list_section(r"Complaints On Admission\s*:", r"Medical History|Vital on Admission\s*:")
         if not lines:
             return []
         txt = re.sub(r"\s+", " ", " ".join(lines)).strip()
@@ -425,7 +454,7 @@ def build_json(t: str) -> dict:
         return [p.strip() + ("." if p and not p.strip().endswith(".") else "") for p in parts if p.strip()]
 
     def parse_advice_on_discharge():
-        block = section(r"Advice On Discharge\s*:", r"Diet Advice\s*:")
+        block = section(r"Advice On Discharge\s*:", r"Diet Advice|Condition of patient at Discharge\s*:")
         block = normalize_block_text(block)
         if not block:
             return []
@@ -439,6 +468,28 @@ def build_json(t: str) -> dict:
             return []
         parts = re.split(r"\.\s+", block)
         return [p.strip() + ("." if p and not p.strip().endswith(".") else "") for p in parts if p.strip()]
+    
+    def parse_vitals_on_discharge():
+        blk = section(r"VITAL\s+ON\s+DISCHARGE\s*:", r"Follow\s*Up|Signature")
+        if not blk:
+            return None
+
+        s = re.sub(r"\s+", " ", blk)
+
+        def extract(pattern):
+            m = re.search(pattern, s, re.IGNORECASE)
+            return clean_val(m.group(1)) if m else None
+
+        return {
+                "weight": extract(r"\bW\s*:\s*([0-9.]+\s*KG)\b"),
+                "hemo_glucose_test": extract(r"HGT:\s*([0-9/]+)"),
+                "blood_pressure": extract(r"BP:\s*([0-9/]+)"),
+                "heart_rate": extract(r"HR:\s*([0-9]+)"),
+                "temperature": extract(r"TEMPERATURE:\s*([0-9\.]+)\s*°?\s*F"),
+                "respiratory_rate": extract(r"RR:\s*([0-9]+)"),
+                "spo2": extract(r"SPO2:\s*([0-9]+%?)"),
+                "sugar": extract(r"SUGAR:\s*([0-9]+)\s*MG/DL"),
+            }
 
     def parse_investigation():
         inv_block = section(r"Investigation\s*:", r"Course In Hospital\s*:")
@@ -474,6 +525,165 @@ def build_json(t: str) -> dict:
                     names.append("Dr. " + p)
         return names
 
+    def parse_procedure():
+        blk = section(r"Procedure\s*:\s*", r"Diagnosis|VITAL\s+ON\s+ADMISSION|L/E|General\s*Examination|Complaints|Medical\s*History|Treatment|Investigation|Course|Advice|Diet|Discharge\s*Notes")
+        blk = normalize_block_text(blk)
+        return clean_val(blk) if blk else None
+    
+    def parse_vitals_on_admission():
+        blk = section(r"VITAL\s+ON\s+ADMISSION\s*:", r"General\s*Examination|L/E|Systematic|Systemic|Complaints|Medical\s*History|Diagnosis")
+        if not blk:
+            return None
+
+        s = re.sub(r"\s+", " ", blk)
+
+        def g(p):
+            m = re.search(p, s, re.IGNORECASE)
+            return clean_val(m.group(1)) if m else None
+
+        return {
+            "weight": g(r"\bW\s*:\s*([0-9.]+\s*KG)\b"),
+            "blood_pressure": g(r"\bBP\s*:\s*([0-9/]+)"),
+            "heart_rate": g(r"\bHR\s*:\s*([0-9]+/?MIN)"),
+            "temperature": g(r"\bTEMPERATURE\s*:\s*([0-9.]+)\s*°?\s*F"),
+            "respiratory_rate": g(r"\bRR\s*:\s*([0-9]+)"),
+            "spo2": g(r"\bSPO2\s*:\s*([0-9]+%?)"),
+        }
+
+    def parse_kv_block(text: str):
+        if not text:
+            return {}
+
+        s = re.sub(r"\s+", " ", text).strip()
+
+        m = re.search(r"\((.+?)\)", s)
+        core = m.group(1) if m else s
+
+        core = core.replace(" | ", ", ")
+        parts = [p.strip(" ,") for p in core.split(",") if p.strip(" ,")]
+
+        out = {}
+        for p in parts:
+            p = re.sub(r"\s+", " ", p).strip()
+            m1 = re.match(r"^([^:]+)\s*:\s*(.+)$", p)
+            if m1:
+                k = clean_val(m1.group(1))
+                v = clean_val(m1.group(2))
+                if k and v:
+                    out[k] = v
+                continue
+
+            m2 = re.match(r"^([^:-]+)\s*-\s*(.+)$", p)
+            if m2:
+                k = clean_val(m2.group(1))
+                v = clean_val(m2.group(2))
+                if k and v:
+                    out[k] = v
+                continue
+
+        return out
+    
+    def parse_local_examination():
+        blk = section(r"\bL/E\s*:\s*", r"General\s*Examination|Systematic|Systemic|Diagnosis|Complaints|Medical\s*History|Treatment|Investigation|Course|Advice|Diet")
+        if not blk:
+            return None 
+        return parse_kv_block(blk)
+    
+    def parse_general_examination():
+        blk = section(r"General\s*examination\s*:?", r"Systematic\s*examination\s*:|Systemic\s*examination\s*:|Pain\s*assessment|Diagnosis|Drug Advice|Discharge notes")
+        blk = normalize_block_text(blk)    
+        if not blk:
+            return None 
+        return parse_kv_block(blk) if blk else None
+    
+    def parse_systemic_examination():
+        blk = section(r"(Systematic|Systemic)\s*examination\s*:?", r"Pain\s*assessment|Diagnosis|Drug Advice|Discharge notes")
+        blk = normalize_block_text(blk)
+        if not blk:
+            return None 
+        return parse_kv_block(blk) if blk else None
+    
+    def parse_pain_assessment():
+        blk = section(r"Pain\s*assessment\s*:?", r"Diagnosis|Drug Advice|Discharge notes|Investigation|Course In Hospital|Advice On Discharge|Diet Advice|Medical History")
+        blk = normalize_block_text(blk)
+        if not blk:
+            return None
+        blk = re.sub(r"^Pain\s*assessment\s*:?", "", blk, flags=re.IGNORECASE).strip(" :-")
+        return clean_val(blk) if blk else None
+    
+    def parse_next_follow_up():
+        blk = section(r"Follow\s*Up\s*", r"Signature|Prepared By|Diagnosis|Drug Advice")
+        if not blk:
+            return {"date": None, "time": None, "doctor": None, "location": None}
+
+        s = re.sub(r"\s+", " ", blk)
+
+        date_re = r"(\d{1,2}/\d{1,2}/\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})"
+        m_date = re.search(date_re, s)
+        fu_date = m_date.group(1) if m_date else None
+
+        m_time = re.search(r"(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))|@\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)", s)
+        fu_time = (m_time.group(1) or m_time.group(2)).strip() if m_time else None
+
+        m_doc = re.search(r"\bDr\.?\s*([A-Za-z\.\s]+?)(?:'s\s*OPD|\bOPD\b)", s, re.IGNORECASE)
+        fu_doctor = ("Dr. " + m_doc.group(1).strip()).replace("Dr. Dr.", "Dr.") if m_doc else None
+
+        m_loc = re.search(r"\b(?:at|in)\s+([A-Za-z ]+Hospital|[A-Za-z ]+Clinic|[A-Za-z ]+OPD)\b", s, re.IGNORECASE)
+        fu_loc = m_loc.group(1).strip() if m_loc else None
+
+        return {"date": fu_date, "time": fu_time, "doctor": fu_doctor, "location": fu_loc}
+    
+    def parse_operative_notes():
+        blk = section(
+            r"Operative\s*Notes\s*:",
+            r"Diagnosis|Drug Advice|Discharge notes|Complaints|Medical History|Treatment Given|Investigation|Course In Hospital|Advice On Discharge|Diet Advice|Signature|Prepared By"
+        )
+        blk = normalize_block_text(blk)
+        if not blk:
+            return None
+
+        date = None
+        m_date = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", blk)
+        if m_date:
+            date = m_date.group(1)
+
+        procedure = None
+        m_proc = re.search(r"\b\d{2}/\d{2}/\d{4}\s*-\s*(.*?)(?=\bby\s+Dr\b|$)", blk, re.IGNORECASE)
+        if m_proc:
+            procedure = clean_val(m_proc.group(1))
+
+        surgeon = None
+        m_doc = re.search(r"\bby\s+Dr\.?\s*([A-Za-z\.\s]+?)(?=\s+under\b|\s+By\s+Dr\b|,|$)", blk, re.IGNORECASE)
+        if m_doc:
+            surgeon = ("Dr. " + m_doc.group(1).strip()).replace("Dr. Dr.", "Dr.")
+
+        anesthesia = None
+        m_an = re.search(r"\bunder\s+([A-Za-z ]+)\b", blk, re.IGNORECASE)
+        if m_an:
+            anesthesia = clean_val(m_an.group(1))
+
+        anesthetist = None
+        m_an_doc = re.search(r"\bBy\s+Dr\.?\s*([A-Za-z\.\s]+?)(?:,|$)", blk, re.IGNORECASE)
+        if m_an_doc:
+            anesthetist = ("Dr. " + m_an_doc.group(1).strip()).replace("Dr. Dr.", "Dr.")
+
+        red_flags = []
+        m_rf = re.search(r"\b(?:Adv(?:\s*inform)?|Advice)\b.*?\bSOS\b\s*if\s*(.+)$", blk, re.IGNORECASE)
+        if m_rf:
+            txt = m_rf.group(1).strip(" ,.")
+            txt = txt.replace(" or ", ", ")
+            red_flags = [x.strip(" ,.") for x in txt.split(",") if x.strip(" ,.")]
+
+        return {
+            "raw": blk,
+            "date": date,
+            "procedure": procedure,
+            "performed_by": surgeon,
+            "anesthesia": anesthesia,
+            "anesthetist": anesthetist,
+            "red_flags": red_flags,
+        }
+
     patient_name = find(r"NAME\s*:\s*([^\n]+)")
     doctor = find(
         r"Doctor\s*:\s*(.+?)(?=\n(?:IPD\s*NO|UHID|WARD/BED\s*NO|AGE|Admitted\s*Date|Discharged\s*Date|DISCHARGE\s*TYPE|SECONDARY\s*CONSULTANT)\s*:)",
@@ -484,10 +694,12 @@ def build_json(t: str) -> dict:
     ipd_no = find(r"IPD\s*NO\s*:\s*([A-Z0-9 ]+)")
     uhid = find(r"UHID\s*:\s*([A-Z0-9]+)")
     ward_bed_no = find(r"WARD/\s*BED\s*NO\s*:\s*([^\n]+)")
-    admitted_date = find(r"Admitted\s*Date\s*:\s*([0-9/:\s]+)")
+    admitted_date_raw = find(r"Admitted\s*Date\s*:\s*([0-9/:\s]+)")
+    admitted_date = to_iso_datetime(admitted_date_raw) if admitted_date_raw else None
+    discharged_date_raw = find(r"Discharged\s*Date\s*:\s*([^\n]+)")
+    discharged_date = to_iso_datetime(discharged_date_raw) if discharged_date_raw else None
     discharge_type = find(r"DISCHARGE\s*TYPE\s*:\s*([^\n]+)")
     payer_type = find(r"Payer\s*Type\s*:\s*([^\n]+)")
-    discharged_date = find(r"Discharged\s*Date\s*:\s*([^\n]+)")
 
     age = None
     gender = None
@@ -514,18 +726,20 @@ def build_json(t: str) -> dict:
     course_in_hospital = parse_course_in_hospital()
     advice_on_discharge = parse_advice_on_discharge()
     diet_advice = parse_diet_advice()
-    condition_discharge = list_section(r"Condition of patient at Discharge\s*:", r"VITAL ON DISCHARGE\s*:")
-
-    bp = find(r"BP:\s*([0-9/]+)", re.IGNORECASE)
-    hr = find(r"HR:\s*([0-9]+)", re.IGNORECASE)
-    temp = find(r"TEMPERATURE:\s*([0-9\.]+)\s*°?\s*F", re.IGNORECASE)
-    rr = find(r"RR:\s*([0-9]+)", re.IGNORECASE)
-    spo2 = find(r"SPO2:\s*([0-9]+%?)", re.IGNORECASE)
-    sbs = find(r"SUGAR:\s*([0-9]+)\s*MG/DL", re.IGNORECASE)
-
+    condition_discharge = list_section(r"Condition of patient at Discharge\s*:", r"Follow Up|VITAL ON DISCHARGE\s*:")
+    vitals_on_discharge = parse_vitals_on_discharge()
     signatures = parse_signatures()
     prepared_by = find(r"Prepared By:\s*([^\n]+)")
     authorized_signatory = "AUTHORIZED SIGNATORY" if re.search(r"AUTHORIZED SIGNATORY", t, re.IGNORECASE) else None
+
+    procedure = parse_procedure()
+    vitals_on_admission = parse_vitals_on_admission()
+    local_examination = parse_local_examination()
+    general_examination = parse_general_examination()
+    systemic_examination = parse_systemic_examination()
+    pain_assessment = parse_pain_assessment()
+    next_follow_up = parse_next_follow_up()
+    operative_notes = parse_operative_notes()
 
     return {
         "patient_name": patient_name,
@@ -543,23 +757,26 @@ def build_json(t: str) -> dict:
         "provisional_diagnosis": provisional_diagnosis,
         "diagnosis": diagnosis,
         "drug_advice": drug_advice,
+        "procedure": procedure,
         "discharge_notes": discharge_notes,
         "complaints_on_admission": complaints,
+        "vitals_on_admission": vitals_on_admission,
+        "examination": {
+            "local_examination": local_examination,
+            "general_examination": general_examination,
+            "systemic_examination": systemic_examination,
+            "pain_assessment": pain_assessment,
+        },
         "medical_history": medical_history,
         "treatment_given": treatment_given,
         "investigation": investigation,
         "course_in_hospital": course_in_hospital,
+        "operative_notes": operative_notes,
         "advice_on_discharge": advice_on_discharge,
         "diet_advice": diet_advice,
         "condition_of_patient_at_discharge": condition_discharge,
-        "vitals_on_discharge": {
-            "blood_pressure": bp,
-            "heart_rate": hr,
-            "temperature": temp,
-            "respiratory_rate": rr,
-            "spo2": spo2,
-            "spot_blood_sugar": sbs,
-        },
+        "vitals_on_discharge": vitals_on_discharge,
+        "next_follow_up": next_follow_up,
         "signatures": signatures,
         "prepared_by": prepared_by,
         "authorized_signatory": authorized_signatory,
@@ -577,7 +794,31 @@ def upload():
 
     pdf_bytes = file.read()
     cleaned = clean_text(extract_text_from_pdf(pdf_bytes))
-    return jsonify(build_json(cleaned)), 200
+    #return jsonify(build_json(cleaned)), 200
+    data = build_json(cleaned)
+
+    db = SessionLocal()
+
+    try:
+        row = Report(
+            patient_name=data.get("patient_name"),
+            admitted_date=data.get("admitted_date"),
+            discharged_date=data.get("discharged_date"),
+            discharge_notes=json.dumps(data.get("discharge_notes")),
+        )
+
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+
+        return jsonify({"id": row.id, "patient_name": row.patient_name, "admitted_date": row.admitted_date, "discharged_date": row.discharged_date, "discharge_notes": json.loads(row.discharge_notes)}), 200
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
