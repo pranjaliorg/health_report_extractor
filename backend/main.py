@@ -1,3 +1,5 @@
+from unicodedata import name
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pypdf import PdfReader
@@ -146,46 +148,104 @@ def build_json(t: str) -> dict:
         return out
 
     def parse_diagnosis(block: str):
-        out = []
         if not block:
-            return out
+            return []
 
-        lines = [ln.strip(" ,") for ln in block.splitlines() if ln.strip()]
-        sr = 1
+        raw = [x.strip().strip(" ,") for x in block.splitlines() if x.strip()]
 
-        for ln in lines:
-            m1 = re.match(r"^(\d+)\s+(.*?)-\s*([A-Z]\d[\w\.]*)$", ln)
-            if m1:
-                out.append(
-                    {
-                        "sr_no": int(m1.group(1)),
-                        "diagnosis": clean_val(m1.group(2).lstrip("- ").strip()),
-                        "icd_code": clean_val(m1.group(3)),
-                    }
-                )
-                sr = int(m1.group(1)) + 1
+        joined = []
+        i = 0
+        while i < len(raw):
+            a = raw[i]
+            b = raw[i + 1] if i + 1 < len(raw) else ""
+
+            a_ends = a.lower().rstrip(".").endswith("approx")
+            a_open = a.count("(") > a.count(")")
+            b_cont = bool(b) and (re.match(r"^\d", b) or "cc" in b.lower() or b.startswith(("-", ";", ")")))
+
+            if b and (a_ends or a_open) and b_cont:
+                joined.append((a + " " + b).strip())
+                i += 2
+            else:
+                joined.append(a)
+                i += 1
+
+        code = r"(?:(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{2,7}(?:\.[A-Z0-9]{1,6})?|[0-9]{5})"
+
+        res = []
+        idx = 1
+
+        def push(text, c):
+            text = clean_val((text or "").strip(" -–—:").strip())
+            c = clean_val((c or "").strip())
+            if not text and not c:
+                return
+            res.append({"sr_no": idx, "diagnosis": text or None, "icd_code": c or None})
+
+        for line in joined:
+            if "," in line and len(re.findall(code, line, flags=re.I)) >= 2:
+                chunks = [p.strip().strip(" ,") for p in re.split(r"\s*,\s*", line) if p.strip()]
+                for ch in chunks:
+                    m = re.match(rf"^(\d+)\s+(.*?)[\s]*[-–—:][\s]*({code})$", ch, flags=re.I)
+                    if m:
+                        idx = int(m.group(1))
+                        push(m.group(2), m.group(3))
+                        idx += 1
+                        continue
+
+                    m = re.match(rf"^({code})[\s]*[-–—:][\s]*(.*)$", ch, flags=re.I)
+                    if m and m.group(2).strip():
+                        push(m.group(2), m.group(1))
+                        idx += 1
+                        continue
+
+                    m = re.match(rf"^(.*?)[\s]*[-–—:][\s]*({code})$", ch, flags=re.I)
+                    if m and m.group(1).strip():
+                        push(m.group(1), m.group(2))
+                        idx += 1
                 continue
 
-            m2 = re.match(r"^(.*?)-\s*([A-Z]\d[\w\.]*)$", ln)
-            if m2:
-                out.append(
-                    {"sr_no": sr, "diagnosis": clean_val(m2.group(1).lstrip("- ").strip()), "icd_code": clean_val(m2.group(2))}
-                )
-                sr += 1
+            m = re.match(rf"^(\d+)\s+(.*?)[\s]*[-–—:][\s]*({code})$", line, flags=re.I)
+            if m:
+                idx = int(m.group(1))
+                push(m.group(2), m.group(3))
+                idx += 1
+                continue
+
+            m = re.match(rf"^({code})[\s]*[-–—:][\s]*(.*)$", line, flags=re.I)
+            if m and m.group(2).strip():
+                push(m.group(2), m.group(1))
+                idx += 1
+                continue
+
+            m = re.match(rf"^(.*?)[\s]*[-–—:][\s]*({code})$", line, flags=re.I)
+            if m and m.group(1).strip():
+                push(m.group(1), m.group(2))
+                idx += 1
+                continue
+
+            m = re.match(rf"^({code})\s+(.*)$", line, flags=re.I)
+            if m and m.group(2).strip():
+                push(m.group(2), m.group(1))
+                idx += 1
+                continue
+
+            if res:
+                res[-1]["diagnosis"] = clean_val(((res[-1].get("diagnosis") or "") + " " + line).strip())
 
         seen = set()
-        unique = []
-        for d in out:
-            key = ((d.get("diagnosis") or "").lower(), (d.get("icd_code") or "").lower())
-            if key in seen:
+        final = []
+        for d in res:
+            k = ((d.get("diagnosis") or "").lower(), (d.get("icd_code") or "").lower())
+            if k in seen:
                 continue
-            seen.add(key)
-            unique.append(d)
+            seen.add(k)
+            final.append(d)
 
-        for i, d in enumerate(unique, start=1):
-            d["sr_no"] = i
+        for n, d in enumerate(final, start=1):
+            d["sr_no"] = n
 
-        return unique
+        return final
 
     def parse_schedule(line: str):
         m = re.match(r"^\s*(\d+(?:/\d+)?)\s*-\s*(\d+(?:/\d+)?)\s*-\s*(\d+(?:/\d+)?)\s*(.*)$", line)
@@ -469,6 +529,31 @@ def build_json(t: str) -> dict:
         parts = re.split(r"\.\s+", block)
         return [p.strip() + ("." if p and not p.strip().endswith(".") else "") for p in parts if p.strip()]
     
+    def parse_condition_on_discharge():
+        blk = section(
+            r"Condition of patient at Discharge\s*:",
+            r"Follow Up|VITAL\s+ON\s+DISCHARGE\s*:|Signature|Prepared By"
+        )
+        blk = re.sub(r"\s+", " ", blk).strip()
+        if not blk:
+            return {"text": None, "vitals": None}
+
+        def grab(p):
+            m = re.search(p, blk, re.IGNORECASE)
+            return clean_val(m.group(1)) if m else None
+
+        vitals = {
+            "hgt": grab(r"\bHGT\s*[-:]\s*([0-9/]+)"),
+            "bp": grab(r"\bBP\s*[-:]\s*([0-9/]+)"),
+            "spo2": grab(r"\bSpO2\s*[-:]\s*([0-9]+)\s*%?"),
+            "weight": grab(r"\b(?:Wt|W)\s*[-:]\s*([0-9.]+)\s*Kg"),
+        }
+
+        txt = re.sub(r"\b(HGT|BP|SpO2|Wt|W)\s*[-:]\s*[^,\.]+", "", blk, flags=re.I)
+        txt = re.sub(r"\s+,", ",", txt).strip(" ,.")
+
+        return {"text": clean_val(txt), "vitals": vitals}
+    
     def parse_vitals_on_discharge():
         blk = section(r"VITAL\s+ON\s+DISCHARGE\s*:", r"Follow\s*Up|Signature")
         if not blk:
@@ -482,13 +567,14 @@ def build_json(t: str) -> dict:
 
         return {
                 "weight": extract(r"\bW\s*:\s*([0-9.]+\s*KG)\b"),
-                "hemo_glucose_test": extract(r"HGT:\s*([0-9/]+)"),
                 "blood_pressure": extract(r"BP:\s*([0-9/]+)"),
                 "heart_rate": extract(r"HR:\s*([0-9]+)"),
                 "temperature": extract(r"TEMPERATURE:\s*([0-9\.]+)\s*°?\s*F"),
                 "respiratory_rate": extract(r"RR:\s*([0-9]+)"),
                 "spo2": extract(r"SPO2:\s*([0-9]+%?)"),
                 "sugar": extract(r"SUGAR:\s*([0-9]+)\s*MG/DL"),
+                "general_rbs": extract(r"RBS:\s*([0-9]+)\s*MG/DL"),
+                "urine_output": extract(r"URINE\s*OUTPUT:\s*([0-9]+)")
             }
 
     def parse_investigation():
@@ -512,18 +598,37 @@ def build_json(t: str) -> dict:
         return out
 
     def parse_signatures():
-        sig_block = section(r"Signature\s*", r"Prepared By\s*:")
-        if not sig_block:
+        blk = section(r"Signature\s*", r"Prepared By|Patient/Relative Signature|Patient\s*/\s*Relative\s*Signature|Authorized|AUTHORISED")
+        if not blk:
             return []
-        lines = [ln.strip() for ln in sig_block.splitlines() if ln.strip()]
-        doctor_lines = [ln for ln in lines if ln.startswith("Dr.")]
+
+        lines = [re.sub(r"\s+", " ", l).strip() for l in blk.splitlines() if l.strip()]
+
         names = []
-        for line in doctor_lines:
-            for p in line.split("Dr."):
-                p = p.strip()
-                if p:
-                    names.append("Dr. " + p)
-        return names
+        for line in lines:
+            if re.search(r"\b(incharge|consultant|resident|typed\s*by|nurse)\b", line, re.I):
+                continue
+            if line.lower().startswith("signature"):
+                continue
+            if re.search(r"signature|incharge|consultant|resident|typed|nurse", line, re.I):
+                continue
+            names.append(line)
+
+        if not names:
+            return []
+
+        name_line = names[0]
+
+        parts = re.split(r"\bDr\.?\s*", name_line)
+        result = []
+
+        for i, p in enumerate(parts):
+            p = p.strip(" ,.-")
+            if not p:
+                continue
+            result.append(p if i == 0 else "Dr. " + p)
+
+        return result
 
     def parse_procedure():
         blk = section(r"Procedure\s*:\s*", r"Diagnosis|VITAL\s+ON\s+ADMISSION|L/E|General\s*Examination|Complaints|Medical\s*History|Treatment|Investigation|Course|Advice|Diet|Discharge\s*Notes")
@@ -726,7 +831,7 @@ def build_json(t: str) -> dict:
     course_in_hospital = parse_course_in_hospital()
     advice_on_discharge = parse_advice_on_discharge()
     diet_advice = parse_diet_advice()
-    condition_discharge = list_section(r"Condition of patient at Discharge\s*:", r"Follow Up|VITAL ON DISCHARGE\s*:")
+    condition_discharge = parse_condition_on_discharge()
     vitals_on_discharge = parse_vitals_on_discharge()
     signatures = parse_signatures()
     prepared_by = find(r"Prepared By:\s*([^\n]+)")
@@ -794,7 +899,7 @@ def upload():
 
     pdf_bytes = file.read()
     cleaned = clean_text(extract_text_from_pdf(pdf_bytes))
-    #return jsonify(build_json(cleaned)), 200
+    return jsonify(build_json(cleaned)), 200
     data = build_json(cleaned)
 
     db = SessionLocal()
