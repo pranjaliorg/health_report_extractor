@@ -1,3 +1,4 @@
+import code
 from unicodedata import name
 
 from flask import Flask, request, jsonify
@@ -151,87 +152,73 @@ def build_json(t: str) -> dict:
         if not block:
             return []
 
-        raw = [x.strip().strip(" ,") for x in block.splitlines() if x.strip()]
+        def norm(s):
+            s = re.sub(r"\bDiagnosis\s*:\s*", "", s, flags=re.I)
+            s = re.sub(r"\s+", " ", s).strip(" ,")
+            return clean_val(s)
 
-        joined = []
+        code_pat = r"(?:(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{2,7}(?:\.[A-Z0-9]{1,6})?|[0-9]{5})"
+        pair_re = re.compile(rf"({code_pat})\s*(?:[-–—:]\s*)?(.+?)(?=(?:\s*,\s*{code_pat})|$)", re.I)
+
+        raw = [norm(x) for x in block.splitlines() if x.strip()]
+        raw = [x for x in raw if x]
+
+        merged = []
         i = 0
         while i < len(raw):
             a = raw[i]
-            b = raw[i + 1] if i + 1 < len(raw) else ""
+            b = raw[i + 1] if i + 1 < len(raw) else None
 
-            a_ends = a.lower().rstrip(".").endswith("approx")
             a_open = a.count("(") > a.count(")")
+            a_ends = a.lower().rstrip(".").endswith("approx")
             b_cont = bool(b) and (re.match(r"^\d", b) or "cc" in b.lower() or b.startswith(("-", ";", ")")))
 
-            if b and (a_ends or a_open) and b_cont:
-                joined.append((a + " " + b).strip())
+            if b and (a_open or a_ends) and b_cont:
+                merged.append(norm(a + " " + b))
                 i += 2
             else:
-                joined.append(a)
+                merged.append(a)
                 i += 1
 
-        code = r"(?:(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{2,7}(?:\.[A-Z0-9]{1,6})?|[0-9]{5})"
-
         res = []
-        idx = 1
 
-        def push(text, c):
-            text = clean_val((text or "").strip(" -–—:").strip())
-            c = clean_val((c or "").strip())
-            if not text and not c:
+        def add(diag, code):
+            diag = norm((diag or "").strip(" -–—:"))
+            code = norm(code)
+            if code and re.fullmatch(r"\d+\s*(cc|ml|kg|mmhg|mg|mcg|gm|g|iu|%)", code, re.I):
                 return
-            res.append({"sr_no": idx, "diagnosis": text or None, "icd_code": c or None})
 
-        for line in joined:
-            if "," in line and len(re.findall(code, line, flags=re.I)) >= 2:
-                chunks = [p.strip().strip(" ,") for p in re.split(r"\s*,\s*", line) if p.strip()]
-                for ch in chunks:
-                    m = re.match(rf"^(\d+)\s+(.*?)[\s]*[-–—:][\s]*({code})$", ch, flags=re.I)
-                    if m:
-                        idx = int(m.group(1))
-                        push(m.group(2), m.group(3))
-                        idx += 1
-                        continue
+            if diag in (")", "(", ""):
+                diag = None
+                
+            if not diag and not code:
+                return
+            res.append({"diagnosis": diag or None, "icd_code": code or None})
 
-                    m = re.match(rf"^({code})[\s]*[-–—:][\s]*(.*)$", ch, flags=re.I)
-                    if m and m.group(2).strip():
-                        push(m.group(2), m.group(1))
-                        idx += 1
-                        continue
-
-                    m = re.match(rf"^(.*?)[\s]*[-–—:][\s]*({code})$", ch, flags=re.I)
-                    if m and m.group(1).strip():
-                        push(m.group(1), m.group(2))
-                        idx += 1
+        for line in merged:
+            pairs = list(pair_re.finditer(line))
+            if pairs:
+                for m in pairs:
+                    add(m.group(2), m.group(1))
                 continue
 
-            m = re.match(rf"^(\d+)\s+(.*?)[\s]*[-–—:][\s]*({code})$", line, flags=re.I)
+            m = re.match(rf"^(\d+)\s+(.*?)[\s]*[-–—:][\s]*({code_pat})$", line, flags=re.I)
             if m:
-                idx = int(m.group(1))
-                push(m.group(2), m.group(3))
-                idx += 1
+                add(m.group(2), m.group(3))
                 continue
 
-            m = re.match(rf"^({code})[\s]*[-–—:][\s]*(.*)$", line, flags=re.I)
-            if m and m.group(2).strip():
-                push(m.group(2), m.group(1))
-                idx += 1
-                continue
-
-            m = re.match(rf"^(.*?)[\s]*[-–—:][\s]*({code})$", line, flags=re.I)
+            m = re.match(rf"^(.*?)[\s]*[-–—:][\s]*({code_pat})$", line, flags=re.I)
             if m and m.group(1).strip():
-                push(m.group(1), m.group(2))
-                idx += 1
+                add(m.group(1), m.group(2))
                 continue
 
-            m = re.match(rf"^({code})\s+(.*)$", line, flags=re.I)
+            m = re.match(rf"^({code_pat})\s+(.*)$", line, flags=re.I)
             if m and m.group(2).strip():
-                push(m.group(2), m.group(1))
-                idx += 1
+                add(m.group(2), m.group(1))
                 continue
 
             if res:
-                res[-1]["diagnosis"] = clean_val(((res[-1].get("diagnosis") or "") + " " + line).strip())
+                res[-1]["diagnosis"] = norm(((res[-1].get("diagnosis") or "") + " " + line).strip())
 
         seen = set()
         final = []
@@ -241,34 +228,57 @@ def build_json(t: str) -> dict:
                 continue
             seen.add(k)
             final.append(d)
+        out = []
+        for i, d in enumerate(final, start=1):
+            out.append({"sr_no": i, "diagnosis": d.get("diagnosis"), "icd_code": d.get("icd_code")})
 
-        for n, d in enumerate(final, start=1):
-            d["sr_no"] = n
-
-        return final
+        return out
 
     def parse_schedule(line: str):
-        m = re.match(r"^\s*(\d+(?:/\d+)?)\s*-\s*(\d+(?:/\d+)?)\s*-\s*(\d+(?:/\d+)?)\s*(.*)$", line)
+        line = re.sub(r"\s+", " ", (line or "")).strip()
+        if not line:
+            return None
+
+        if "SOS" in line.upper() and not re.search(r"\d+\s*-\s*\d+", line):
+            return {
+                "dose_schedule": None,
+                "timing": None,
+                "frequency": "SOS",
+                "duration_days": None,
+                "quantity": None,
+            }
+
+        m = re.match(r"^(\d+(?:/\d+)?(?:\s*-\s*\d+(?:/\d+)?){2,3})\s*(.*)$", line)
         if not m:
             return None
 
-        dose_schedule = f"{m.group(1)} - {m.group(2)} - {m.group(3)}"
-        rest = m.group(4).strip()
-        parts = [p.strip() for p in rest.split(" - ")]
+        dose_schedule = m.group(1).strip()
+        rest = m.group(2).strip()
 
+        parts = [p.strip() for p in rest.split(" - ") if p.strip()]
         timing = parts[0] if len(parts) >= 1 else None
         frequency = parts[1] if len(parts) >= 2 else None
 
         duration_days = None
         quantity = None
+
         if len(parts) >= 3:
             last = parts[2]
-            md = re.search(r"(\d+)\s*Day\(s\)", last, re.IGNORECASE)
+
+            md = re.search(r"(\d+)\s*Day\(s\)", last, re.I)
             if md:
                 duration_days = int(md.group(1))
-            mq = re.search(r"Day\(s\)\s*(\d+)\s*$", last, re.IGNORECASE)
+
+            mm = re.search(r"(\d+)\s*Month\(s\)", last, re.I)
+            if mm:
+                duration_days = int(mm.group(1)) * 30
+
+            mq = re.search(r"(?:Day|Month)\(s\)\s*(\d+)", last, re.I)
             if mq:
                 quantity = int(mq.group(1))
+
+        if "SOS" in rest.upper():
+            frequency = "SOS"
 
         return {
             "dose_schedule": dose_schedule,
@@ -277,32 +287,52 @@ def build_json(t: str) -> dict:
             "duration_days": duration_days,
             "quantity": quantity,
         }
-    
+
+
     def infer_unit(name: str):
         s = (name or "").upper()
         if "OINT" in s or "OINTMENT" in s:
             return "ointment"
         if "GEL" in s:
             return "gel"
+        if "DROP" in s or "DROPS" in s or "DRP" in s or "DRPS" in s:
+            return "drop"
+        if "SYRUP" in s or "SYP" in s or "SUSP" in s:
+            return "ml"
+        if "LOZENGE" in s or "LOZENGES" in s or "LOZ" in s:
+            return "lozenge"
+        if "PATCH" in s:
+            return "patch"
         if "CAP" in s or "CAPSULE" in s:
             return "capsule"
         if "TAB" in s or "TABLET" in s:
             return "tablet"
         return "dose"
 
+
     def interpret_schedule(dose_schedule: str, unit="tablet"):
         if not dose_schedule:
             return None
-        parts = [p.strip() for p in dose_schedule.split("-")]
-        if len(parts) != 3:
-            return None
-        times = ["morning", "afternoon", "night"]
-        phrases= []
-        verb = "apply" if unit in ("ointment", "gel") else "take"
 
+        parts = [p.strip() for p in dose_schedule.split("-")]
+        if len(parts) not in (3, 4):
+            return None
+
+        times = ["in morning", "in afternoon", "at night"] if len(parts) == 3 else ["in morning", "in afternoon", "in evening", "at night"]
+
+        if unit in ("ointment", "gel"):
+            verb = "Apply"
+        elif unit == "drop":
+            verb = "Instill"
+        else:
+            verb = "Take"
+
+        phrases = []
         for i, tok in enumerate(parts):
+            tok = tok.strip()
             if tok in ("0", "0.0", ""):
                 continue
+
             qty = tok
             if tok in ("0.5", "1/2"):
                 qty = "1/2"
@@ -312,24 +342,42 @@ def build_json(t: str) -> dict:
                 except:
                     qty = tok
 
-            if verb == "apply":
-                phrases.append(f"Apply in {times[i]}")
+            if verb == "Apply":
+                phrases.append(f"Apply {times[i]}")
+            elif verb == "Instill":
+                phrases.append(f"Instill {qty} {unit} {times[i]}")
             else:
-                phrases.append(f"Take {qty} {unit} in {times[i]}")        
+                phrases.append(f"Take {qty} {unit} {times[i]}")
 
         return ", ".join(phrases) if phrases else None
 
+
     def parse_drug_advice(block: str):
-        out = []
         if not block:
-            return out
+            return []
 
-        raw_lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-        raw_lines = [ln for ln in raw_lines if not re.match(r"^No\s+Name\s+Dose", ln, re.IGNORECASE)]
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        filtered = []
+        for ln in lines:
+            if re.match(r"^No\s+Name\s+Dose", ln, re.I):
+                continue
+            if re.match(r"^Page\s*\|\s*\d+", ln, re.I):
+                continue
+            if re.match(r"^(Discharge\s*notes|Procedure)\s*:", ln, re.I):
+                break
+            filtered.append(ln)
 
-        items, cur = [], []
-        for ln in raw_lines:
-            if re.match(r"^\d+\s+[A-Z]", ln) and cur:
+        start_pat = re.compile(
+            r"^(\d{1,2})\s+(?:"
+            r"(?:TAB|TABLET|CAP|CAPSULE|OINT|OINTMENT|GEL|DRP|DROP|SYRUP|SYP|LOZENGE|LOZENGES|PATCH|ORAL|SOLUTION|DISKETTES)\b"
+            r"|[A-Z]+[A-Z0-9()./-]*\.)",
+            re.I
+        )
+
+        items = []
+        cur = []
+        for ln in filtered:
+            if start_pat.match(ln) and cur:
                 items.append(cur)
                 cur = [ln]
             else:
@@ -337,67 +385,108 @@ def build_json(t: str) -> dict:
         if cur:
             items.append(cur)
 
+        dose_pat = re.compile(r"\d+(?:/\d+)?\s*-\s*\d+(?:/\d+)?\s*-\s*\d+(?:/\d+)?(?:\s*-\s*\d+(?:/\d+)?)?")
+        meta_pat = re.compile(r"\b(After|Before|On|Daily|Weekly|Monthly|SOS|Day\(s\)|Month\(s\))\b", re.I)
+
+        out = []
+
         for item in items:
-            m0 = re.match(r"^(\d+)\s+(.*)$", item[0])
+            m0 = re.match(r"^(\d{1,2})\s+(.+)$", item[0])
             if not m0:
                 continue
 
             sr_no = int(m0.group(1))
-            first_line = m0.group(2).strip()
+            first = m0.group(2).strip()
 
-            name_line = first_line
-            schedule_line = None
+            name_parts = []
+            schedule_parts = []
+            composition_parts = []
             notes = None
-            composition_lines = []
+            quantity = None
 
-            if ("Day(s)" in first_line or "Day(S)" in first_line) and re.search(r"\b(Daily|Weekly|Monthly)\b", first_line, re.IGNORECASE):
-                dose_pos = re.search(r"\d+(?:/\d+)?\s*-\s*\d+(?:/\d+)?\s*-\s*\d+(?:/\d+)?", first_line)
-                if dose_pos:
-                    name_line = first_line[:dose_pos.start()].strip()
-                    schedule_line = first_line[dose_pos.start():].strip()
+            def add_name(x):
+                x = re.sub(r"\s+", " ", x).strip()
+                if x:
+                    name_parts.append(x)
+
+            def add_schedule(x):
+                x = re.sub(r"\s+", " ", x).strip()
+                if x:
+                    schedule_parts.append(x)
+
+            inline = dose_pat.search(first)
+            if inline:
+                add_name(first[:inline.start()].strip())
+                add_schedule(first[inline.start():].strip())
+            else:
+                add_name(first)
 
             for ln in item[1:]:
-                if ln.lower().startswith("notes:"):
-                    notes = clean_val(ln.replace("Notes:", "").strip())
+                s = ln.strip()
+
+                if s.lower().startswith("notes:"):
+                    notes = clean_val(s.split(":", 1)[1].strip())
                     continue
 
-                if ("Day(s)" in ln or "Day(S)" in ln) and re.search(r"\b(Daily|Weekly|Monthly)\b", ln, re.IGNORECASE):
-                    schedule_line = ln.strip()
+                if s == "___":
                     continue
 
-                composition_lines.append(ln)
+                if re.fullmatch(r"\d+", s):
+                    quantity = int(s)
+                    continue
 
-            if composition_lines and composition_lines[0].strip().upper() == "MG":
-                if not re.search(r"\bMG\b", name_line, re.IGNORECASE):
-                    name_line = (name_line + " MG").strip()
-                composition_lines = composition_lines[1:]
+                if s.upper() == "MG":
+                    if name_parts and re.search(r"\d$", name_parts[-1]):
+                        name_parts[-1] = (name_parts[-1] + " MG").strip()
+                        continue
+                    add_name("MG")
+                    continue
 
-            dose_schedule = timing = frequency = duration_days = quantity = None
-            if schedule_line:
-                parsed = parse_schedule(schedule_line)
-                if parsed:
-                    dose_schedule = parsed["dose_schedule"]
-                    timing = parsed["timing"]
-                    frequency = parsed["frequency"]
-                    duration_days = parsed["duration_days"]
-                    quantity = parsed["quantity"]
+                if re.fullmatch(r"\d+(\.\d+)?", s):
+                    add_name(s)
+                    continue
 
-            if quantity is None:
-                for c in composition_lines:
-                    if re.match(r"^\d+$", c.strip()):
-                        quantity = int(c.strip())
-                        break
+                if s.upper() in ("DROPS", "EYE DROPS", "(DRPS)"):
+                    add_name(s)
+                    continue
 
-            composition_lines = [c for c in composition_lines if not re.match(r"^\d+$", c.strip())]
-            composition = clean_val(" ".join(composition_lines))
+                if dose_pat.search(s):
+                    add_schedule(s)
+                    continue
 
-            unit = infer_unit(name_line)
-            dose_schedule_text = interpret_schedule(dose_schedule, unit)
+                if meta_pat.search(s):
+                    add_schedule(s)
+                    continue
+
+                composition_parts.append(s)
+
+            name = clean_val(" ".join(name_parts))
+
+            schedule_line = " ".join(schedule_parts).strip()
+            if not schedule_line and "SOS" in (name or "").upper():
+                schedule_line = "SOS"
+
+            parsed = parse_schedule(schedule_line) if schedule_line else None
+            dose_schedule = timing = frequency = duration_days = qty_from_schedule = None
+            if parsed:
+                dose_schedule = parsed["dose_schedule"]
+                timing = parsed["timing"]
+                frequency = parsed["frequency"]
+                duration_days = parsed["duration_days"]
+                qty_from_schedule = parsed["quantity"]
+
+            if qty_from_schedule:
+                quantity = qty_from_schedule
+
+            composition = clean_val(" ".join(composition_parts)) if composition_parts else None
+
+            unit = infer_unit(name)
+            dose_schedule_text = None if frequency == "SOS" else interpret_schedule(dose_schedule, unit)
 
             out.append(
                 {
                     "sr_no": sr_no,
-                    "name": clean_val(name_line),
+                    "name": name,
                     "composition": composition,
                     "dose_schedule": dose_schedule,
                     "dose_schedule_text": dose_schedule_text,
@@ -699,14 +788,14 @@ def build_json(t: str) -> dict:
         blk = normalize_block_text(blk)    
         if not blk:
             return None 
-        return parse_kv_block(blk) if blk else None
+        return parse_kv_block(blk)
     
     def parse_systemic_examination():
         blk = section(r"(Systematic|Systemic)\s*examination\s*:?", r"Pain\s*assessment|Diagnosis|Drug Advice|Discharge notes")
         blk = normalize_block_text(blk)
         if not blk:
             return None 
-        return parse_kv_block(blk) if blk else None
+        return parse_kv_block(blk)
     
     def parse_pain_assessment():
         blk = section(r"Pain\s*assessment\s*:?", r"Diagnosis|Drug Advice|Discharge notes|Investigation|Course In Hospital|Advice On Discharge|Diet Advice|Medical History")
@@ -790,6 +879,16 @@ def build_json(t: str) -> dict:
         }
 
     patient_name = find(r"NAME\s*:\s*([^\n]+)")
+
+    age = None
+    gender = None
+
+    m = re.search(r"(?:AGE|GENDER|SEX)\s*:\s*(\d+)\s*YEARS?\s*/\s*([MF])", t, re.IGNORECASE)
+
+    if m:
+        age = int(m.group(1))
+        gender = "Male" if m.group(2).upper() == "M" else "Female"
+
     doctor = find(
         r"Doctor\s*:\s*(.+?)(?=\n(?:IPD\s*NO|UHID|WARD/BED\s*NO|AGE|Admitted\s*Date|Discharged\s*Date|DISCHARGE\s*TYPE|SECONDARY\s*CONSULTANT)\s*:)",
         re.IGNORECASE | re.DOTALL
@@ -805,15 +904,6 @@ def build_json(t: str) -> dict:
     discharged_date = to_iso_datetime(discharged_date_raw) if discharged_date_raw else None
     discharge_type = find(r"DISCHARGE\s*TYPE\s*:\s*([^\n]+)")
     payer_type = find(r"Payer\s*Type\s*:\s*([^\n]+)")
-
-    age = None
-    gender = None
-
-    m = re.search(r"(?:AGE|GENDER|SEX)\s*:\s*(\d+)\s*YEARS?\s*/\s*([MF])", t, re.IGNORECASE)
-
-    if m:
-        age = int(m.group(1))
-        gender = "Male" if m.group(2).upper() == "M" else "Female"
 
     referred_to = []
     for m in re.finditer(r"Sr\s*No:-\s*(\d+),\s*Doctor:-\s*([^,]+),\s*Department:-\s*([^,]+)", t, re.IGNORECASE):
@@ -924,7 +1014,6 @@ def upload():
 
     finally:
         db.close()
-
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)
