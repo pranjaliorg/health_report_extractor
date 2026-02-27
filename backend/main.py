@@ -295,7 +295,7 @@ def build_json(t: str) -> dict:
         rest = m.group(2).strip()
 
         parts = [p.strip() for p in rest.split(" - ") if p.strip()]
-        timing = parts[0] if len(parts) >= 1 else None
+        timing = parts[0] if len(parts) >= 1 and parts[0].strip("_ ") else None
         frequency = parts[1] if len(parts) >= 2 else None
 
         duration_days = None
@@ -392,12 +392,12 @@ def build_json(t: str) -> dict:
 
     def strength_prefix(s: str):
         s = s.strip()
-        if not re.search(r"\d+(?:\.\d+)?/\d+(?:\.\d+)?", s, re.I):
-            return False
+        if re.match(r"^(?:TOTAL\s+|PLUS\s+|R\s*)?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?\s*(?:MG|MCG|GM|G|ML|IU)\b", s, re.I):
+            return True
         if not re.search(r"\b(MG|MCG|GM|G|ML|IU)\b", s, re.I):
             return False
-        if re.match(r"^(?:TOTAL\s+|PLUS\s+|R\s+)?\d", s, re.I):
-            return True
+        #if re.match(r"^(?:TOTAL\s+|PLUS\s+|R\s+)?\d", s, re.I):
+            #return True
         return False
 
 
@@ -407,12 +407,12 @@ def build_json(t: str) -> dict:
 
         first_line = composition_parts[0].strip()
 
-        if first_line.upper().startswith("EMULGEL "):
+        if first_line.upper().startswith("EMULGEL"):
             name_parts.append("EMULGEL")
             composition_parts[0] = first_line[len("EMULGEL"):].strip()
             return
 
-        if first_line.upper().startswith("QPS "):
+        if first_line.upper().startswith("QPS"):
             name_parts.append("QPS")
             composition_parts[0] = first_line[len("QPS"):].strip()
             return
@@ -683,8 +683,60 @@ def build_json(t: str) -> dict:
         block = section(r"Medical History\s*:", r"Treatment Given\s*:")
         if not block:
             return []
-        txt = re.sub(r"\s+", " ", block).strip().replace(",,", ",")
-        return [p.strip(" ,") for p in txt.split(",") if p.strip()]
+
+        txt = normalize_block_text(block).replace(",,", ",")
+
+        txt = re.sub(r",\s*Unspecified\b", " TEMP_UNSPECIFIED", txt, flags=re.I)
+        txt = re.sub(r",\s*(Unspecified\s*-\s*[A-Z]\d)", r" TEMP_UNSPECIFIED \1", txt, flags=re.I)
+
+        txt = re.sub(r"\bDid you undergo any surgery\?\s*:\s*Yes-?", "", txt, flags=re.I)
+        txt = re.sub(r"\bDid you undergo any surgery\?\s*:\s*", "", txt, flags=re.I)
+
+        txt = re.sub(r"\bND\s+S/P\b", " S/P", txt, flags=re.I)
+
+        txt = re.sub(r"\s+(?=(?:[A-Z][A-Z /]+)\s*-\s*(?:Details|Suffering Since)\s*:)", "\n", txt)
+        txt = re.sub(r"\s+(?=S/P\b)", "\n", txt, flags=re.I)
+        txt = re.sub(r"\s+(?=RECENTLY PATIENT ADMITTED\b)", "\n", txt, flags=re.I)
+
+        txt = re.sub(r"\s+(?=(?:\d{4,5}|[A-Z]{1,3}\d[A-Z0-9.]{0,6}|\d[A-Z0-9]{2,5})\s*-\s*)", "\n", txt)
+        txt = re.sub(r"\s+(?=(?:[A-Z]{1,3}\d[A-Z0-9.]{0,6}|\d{4,5})\b(?!\s*-\s*)\s+[A-Z])", "\n", txt)
+
+        raw = []
+        for line in txt.splitlines():
+            for part in line.split(","):
+                part = part.strip(" ,.-")
+                if part:
+                    raw.append(part)
+
+        out = []
+        i = 0
+        while i < len(raw):
+            x = re.sub(r"\s+", " ", raw[i]).strip()
+            x = x.replace("TEMP_UNSPECIFIED", ", Unspecified").strip()
+
+            if x.lower() == "in" and i + 1 < len(raw):
+                out[-1] = clean_val((out[-1] + " in " + raw[i + 1].strip()).strip(" ,.-")) if out else clean_val(x)
+                i += 2
+                continue
+
+            if x.upper() == "S/P" and i + 1 < len(raw):
+                x = "S/P " + raw[i + 1].strip()
+                i += 1
+
+            if re.match(r"^[A-Z]{2,20}$", x) and i + 1 < len(raw) and re.search(r"-\s*(?:Details|Suffering Since)\s*:", raw[i + 1], flags=re.I):
+                x = x + " " + raw[i + 1].strip()
+                i += 1
+
+            if out and re.match(r"^(?:\d{4,5}|[A-Z]{1,3}\d[A-Z0-9.]{0,6}|\d[A-Z0-9]{2,5})\s*-\s*", x):
+                out[-1] = clean_val((out[-1] + " " + x).strip(" ,.-"))
+            else:
+                x = clean_val(x)
+                if x:
+                    out.append(x)
+
+            i += 1
+
+        return out
 
     def parse_treatment_given():
         block = section(r"Treatment Given\s*:", r"Investigation\s*:")
@@ -694,7 +746,7 @@ def build_json(t: str) -> dict:
         return [p.strip(" ,") for p in txt.split(",") if p.strip()]
 
     def parse_course_in_hospital():
-        block = section(r"Course In Hospital\s*:", r"Advice On Discharge\s*:")
+        block = section(r"Course In Hospital\s*:", r"Advice On Discharge\s*:|OPerative\s+Notes")
         block = normalize_block_text(block)
         if not block:
             return []
@@ -710,7 +762,7 @@ def build_json(t: str) -> dict:
         return [block] if block else []
 
     def parse_diet_advice():
-        block = section(r"Diet Advice\s*:", r"Condition of patient at Discharge\s*:")
+        block = section(r"Diet Advice\s*:", r"Condition of patient at Discharge\s*:|VITAL\s+ON\s+DISCHARGE\s*:|Follow\s+Up")
         block = normalize_block_text(block)
         if not block:
             return []
@@ -772,17 +824,48 @@ def build_json(t: str) -> dict:
             return out
 
         current = None
+
         for ln in [x.strip() for x in inv_block.splitlines() if x.strip()]:
             m = re.match(r"^(\d{2}/\d{2}/\d{4})\s*[:-]\s*(.+)$", ln)
+
             if m:
                 if current:
                     out.append(current)
-                current = {"date": m.group(1), "tests": [x.strip() for x in m.group(2).split(",") if x.strip()]}
+                current = {
+                    "date": to_iso_datetime(m.group(1)) or m.group(1),
+                    "tests": []
+                }
+                line_text = m.group(2)
             else:
-                if current:
-                    current["tests"] += [x.strip() for x in ln.split(",") if x.strip()]
+                line_text = ln
+
+            if not current:
+                continue
+
+            parts = [p.strip() for p in line_text.split(",") if p.strip()]
+
+            for part in parts:
+                part = re.sub(r"^\-\s*", "", part).strip()
+
+                if not part:
+                    continue
+
+                if current["tests"]:
+                    prev = current["tests"][-1]
+                    prev_u = prev.upper()
+                    if (
+                        re.match(r"^[a-z]", part)
+                        or (("CT" in prev_u or "NON CONTRAST" in prev_u) and (part[:1].isdigit() or re.match(r"^(A|AN|THE|VOLUME|DIFFUSE|SLUDGE|NO|ATHER|SIMPLE|HAE|HEMA)\b", part, re.I)))
+                        or prev.lower().endswith("measuring")
+                    ):
+                        current["tests"][-1] += " " + part
+                        continue
+
+                current["tests"].append(part)
+
         if current:
             out.append(current)
+
         return out
 
     def parse_signatures():
@@ -842,42 +925,6 @@ def build_json(t: str) -> dict:
             "respiratory_rate": g(r"\bRR\s*:\s*([0-9]+)"),
             "spo2": g(r"\bSPO2\s*:\s*([0-9]+%?)"),
         }
-
-    def parse_kv_block(text: str):
-        if not text:
-            return {}
-
-        s = re.sub(r"\r", "\n", text).strip()
-        s = re.sub(r"\n{2,}", "\n", s)
-        s = re.sub(r"\s*\|\s*", "\n", s)
-
-        parts = [p.strip(" ,") for p in s.split("\n") if p.strip(" ,")]
-
-        out = {}
-        for p in parts:
-            p = re.sub(r"\s+", " ", p).strip()
-
-            m1 = re.match(r"^([^:]+)\s*:\s*(.+)$", p)
-            if m1:
-                k = clean_val(m1.group(1))
-                v = clean_val(m1.group(2))
-            else:
-                m2 = re.match(r"^([^:-]+?)\s*-\s*(.+)$", p)
-                if not m2:
-                    continue
-                k = clean_val(m2.group(1))
-                v = clean_val(m2.group(2))
-
-            if not k or not v:
-                continue
-
-            v = v.strip()
-            if v.endswith(")") and v.count("(") < v.count(")"):
-                v = v[:-1].rstrip()
-
-            out[k] = v
-
-        return out
     
     def clean_lines(blk: str):
         blk = blk.replace(" | ", "\n").replace("|", "\n")
