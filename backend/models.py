@@ -2,10 +2,45 @@ from sqlalchemy import Column, Integer, Text
 from db import Base
 
 class Report(Base):
-    __tablename__ = "report_table"
+    __tablename__ = "reports"
 
     id = Column(Integer, primary_key=True)
     patient_name = Column(Text)
+    age = Column(Integer)
+    gender = Column(Text)
+    doctor = Column(Text)
+    ipd_no = Column(Integer)
+    uhid = Column(Integer)
+    ward_bed_no = Column(Text)
     admitted_date = Column(Text)
     discharged_date = Column(Text)
+    discharge_type = Column(Text)
+    referred_by = Column(Text)
+    payer_type = Column(Text)
+    referred_to = Column(Text)
+    provisional_diagnosis = Column(Text)
+    diagnosis = Column(Text)
+    drug_advice = Column(Text)
+    procedure = Column(Text)
     discharge_notes = Column(Text)
+    complaints_on_admission = Column(Text)
+    vitals_on_admission = Column(Text)
+    local_examination = Column(Text)
+    general_examination = Column(Text)
+    systemic_examination = Column(Text)
+    pain_assessment = Column(Text)
+    medical_history = Column(Text)
+    treatment_given = Column(Text)
+    investigation = Column(Text)
+    course_in_hospital = Column(Text)
+    operative_notes = Column(Text)
+    advice_on_discharge = Column(Text)
+    diet_advice = Column(Text)
+    condition_of_patient_at_discharge = Column(Text)
+    vitals_on_discharge = Column(Text)
+    next_follow_up = Column(Text)
+    signatures = Column(Text)
+    prepared_by = Column(Text)
+    authorized_signatory = Column(Text)
+
+ 

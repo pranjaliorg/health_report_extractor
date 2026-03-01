@@ -1204,7 +1204,7 @@ def upload():
 
     pdf_bytes = file.read()
     cleaned = clean_text(extract_text_from_pdf(pdf_bytes))
-    return jsonify(build_json(cleaned)), 200
+    #return jsonify(build_json(cleaned)), 200
     data = build_json(cleaned)
 
     db = SessionLocal()
@@ -1212,16 +1212,86 @@ def upload():
     try:
         row = Report(
             patient_name=data.get("patient_name"),
+            age=data.get("age"),
+            gender=data.get("gender"),
+            doctor=data.get("doctor"),
+            ipd_no=data.get("ipd_no"),
+            uhid=data.get("uhid"),
+            ward_bed_no=data.get("ward_bed_no"),
             admitted_date=data.get("admitted_date"),
             discharged_date=data.get("discharged_date"),
+            discharge_type=data.get("discharge_type"),
+            referred_by=data.get("referred_by"),
+            payer_type=data.get("payer_type"),
+            referred_to=json.dumps(data.get("referred_to")),
+            provisional_diagnosis=json.dumps(data.get("provisional_diagnosis")),
+            diagnosis=json.dumps(data.get("diagnosis")),
+            drug_advice=json.dumps(data.get("drug_advice")),
+            procedure=json.dumps(data.get("procedure")),
             discharge_notes=json.dumps(data.get("discharge_notes")),
+            complaints_on_admission=json.dumps(data.get("complaints_on_admission")),
+            vitals_on_admission=json.dumps(data.get("vitals_on_admission")),
+            local_examination=json.dumps(data.get("examination", {}).get("local_examination")),
+            general_examination=json.dumps(data.get("examination", {}).get("general_examination")),
+            systemic_examination=json.dumps(data.get("examination", {}).get("systemic_examination")),
+            pain_assessment=json.dumps(data.get("examination", {}).get("pain_assessment")),
+            medical_history=json.dumps(data.get("medical_history")),
+            treatment_given=json.dumps(data.get("treatment_given")),
+            investigation=json.dumps(data.get("investigation")),
+            course_in_hospital=json.dumps(data.get("course_in_hospital")),
+            operative_notes=json.dumps(data.get("operative_notes")),
+            advice_on_discharge=json.dumps(data.get("advice_on_discharge")),
+            diet_advice=json.dumps(data.get("diet_advice")),
+            condition_of_patient_at_discharge=json.dumps(data.get("condition_of_patient_at_discharge")),
+            vitals_on_discharge=json.dumps(data.get("vitals_on_discharge")),
+            next_follow_up=json.dumps(data.get("next_follow_up")),
+            signatures=json.dumps(data.get("signatures")),
+            prepared_by=data.get("prepared_by"),
+            authorized_signatory=data.get("authorized_signatory"),
         )
 
         db.add(row)
         db.commit()
         db.refresh(row)
 
-        return jsonify({"id": row.id, "patient_name": row.patient_name, "admitted_date": row.admitted_date, "discharged_date": row.discharged_date, "discharge_notes": json.loads(row.discharge_notes)}), 200
+        return jsonify({"id": row.id, 
+                        "patient_name": row.patient_name,
+                        "age": row.age,
+                        "gender": row.gender,
+                        "doctor": row.doctor,
+                        "ipd_no": row.ipd_no,
+                        "uhid": row.uhid,
+                        "ward_bed_no": row.ward_bed_no,
+                        "admitted_date": row.admitted_date, 
+                        "discharged_date": row.discharged_date, 
+                        "discharge_type": row.discharge_type,
+                        "referred_by": row.referred_by,
+                        "payer_type": row.payer_type,
+                        "referred_to": json.loads(row.referred_to),
+                        "provisional_diagnosis": json.loads(row.provisional_diagnosis),
+                        "diagnosis": json.loads(row.diagnosis),
+                        "drug_advice": json.loads(row.drug_advice),
+                        "procedure": json.loads(row.procedure),
+                        "discharge_notes": json.loads(row.discharge_notes),
+                        "complaints_on_admission": json.loads(row.complaints_on_admission),
+                        "vitals_on_admission": json.loads(row.vitals_on_admission),
+                        "local_examination": json.loads(row.local_examination),
+                        "general_examination": json.loads(row.general_examination),
+                        "systemic_examination": json.loads(row.systemic_examination),
+                        "pain_assessment": json.loads(row.pain_assessment),
+                        "medical_history": json.loads(row.medical_history),
+                        "treatment_given": json.loads(row.treatment_given),
+                        "investigation": json.loads(row.investigation),
+                        "course_in_hospital": json.loads(row.course_in_hospital),
+                        "operative_notes": json.loads(row.operative_notes),
+                        "advice_on_discharge": json.loads(row.advice_on_discharge),
+                        "diet_advice": json.loads(row.diet_advice),
+                        "condition_of_patient_at_discharge": json.loads(row.condition_of_patient_at_discharge),
+                        "vitals_on_discharge": json.loads(row.vitals_on_discharge),
+                        "next_follow_up": json.loads(row.next_follow_up),
+                        "signatures": json.loads(row.signatures),
+                        "prepared_by": row.prepared_by,
+                        "authorized_signatory": row.authorized_signatory}), 200
 
     except Exception as e:
         db.rollback()
